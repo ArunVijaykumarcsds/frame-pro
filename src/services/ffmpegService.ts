@@ -10,7 +10,6 @@ const WASM_LOAD_TIMEOUT_MS = 40_000
 let ffmpegInstance: FFmpeg | null = null
 let isLoaded = false
 
-// Use @ffmpeg/core@0.12.9 — has WASM memory fixes vs 0.12.6
 const CDN_BASES = [
   'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.9/dist/esm',
   'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/esm',
@@ -24,8 +23,6 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
   })
 }
 
-// ─── loadFFmpeg ───────────────────────────────────────────────────────────────
-
 export async function loadFFmpeg(
   onProgress?: (state: Partial<ProcessingState>) => void
 ): Promise<FFmpeg> {
@@ -34,7 +31,6 @@ export async function loadFFmpeg(
     return ffmpegInstance
   }
 
-  // Reset stale instance
   ffmpegInstance = null
   isLoaded = false
 
@@ -48,35 +44,25 @@ export async function loadFFmpeg(
   for (const base of CDN_BASES) {
     try {
       console.log('[FFmpeg] Trying:', base)
-      const coreURL = await withTimeout(
-        toBlobURL(`${base}/ffmpeg-core.js`, 'text/javascript'),
-        WASM_LOAD_TIMEOUT_MS, 'core JS'
-      )
-      const wasmURL = await withTimeout(
-        toBlobURL(`${base}/ffmpeg-core.wasm`, 'application/wasm'),
-        WASM_LOAD_TIMEOUT_MS, 'core WASM'
-      )
+      const coreURL = await withTimeout(toBlobURL(`${base}/ffmpeg-core.js`, 'text/javascript'), WASM_LOAD_TIMEOUT_MS, 'core JS')
+      const wasmURL = await withTimeout(toBlobURL(`${base}/ffmpeg-core.wasm`, 'application/wasm'), WASM_LOAD_TIMEOUT_MS, 'core WASM')
       await withTimeout(ffmpeg.load({ coreURL, wasmURL }), WASM_LOAD_TIMEOUT_MS, 'ffmpeg.load')
-      console.log('[FFmpeg] Loaded from:', base)
+      console.log('[FFmpeg] Loaded OK from:', base)
       loaded = true
       break
     } catch (err) {
-      console.warn('[FFmpeg] Failed CDN:', base, err)
+      console.warn('[FFmpeg] CDN failed:', base, err)
     }
   }
 
   if (!loaded) {
-    throw new Error(
-      'Failed to load FFmpeg from all CDNs. Check your internet connection and that COOP/COEP headers are set on the server.'
-    )
+    throw new Error('Failed to load FFmpeg from all CDNs. Check COOP/COEP headers and internet connection.')
   }
 
   ffmpegInstance = ffmpeg
   isLoaded = true
   return ffmpeg
 }
-
-// ─── getVideoMetadata ─────────────────────────────────────────────────────────
 
 export function getVideoMetadata(file: File): Promise<VideoMetadata> {
   return new Promise((resolve, reject) => {
@@ -127,8 +113,6 @@ export function getVideoMetadata(file: File): Promise<VideoMetadata> {
   })
 }
 
-// ─── extractFrames ────────────────────────────────────────────────────────────
-
 export async function extractFrames(
   file: File,
   metadata: VideoMetadata,
@@ -146,7 +130,7 @@ export async function extractFrames(
   const inputFilename = `input${ext}`
 
   const fileData = await fetchFile(file)
-  console.log('[Extract] File size in memory:', fileData.length, 'bytes')
+  console.log('[Extract] Bytes in memory:', fileData.length)
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   await ffmpeg.writeFile(inputFilename, fileData as any)
@@ -158,35 +142,42 @@ export async function extractFrames(
   const frames: ExtractedFrame[] = []
   const interval = duration / TOTAL_FRAMES
 
-  console.log(`[Extract] duration=${duration}s, interval=${interval.toFixed(4)}s`)
+  console.log(`[Extract] duration=${duration}s interval=${interval.toFixed(4)}s`)
 
-  // Extract frames ONE AT A TIME using -ss seek + -vframes 1
-  // This is the most compatible approach for FFmpeg WASM — avoids the fps
-  // filter graph entirely, which is what causes "memory access out of bounds"
+  onProgress({
+    status: 'extracting',
+    message: 'Extracting frames…',
+    progress: 10,
+    totalFrames: TOTAL_FRAMES,
+    currentFrame: 0,
+  })
+
   for (let i = 0; i < TOTAL_FRAMES; i++) {
     if (signal?.aborted) throw new Error('Cancelled')
 
     const timestamp = i * interval
-    // Seek to timestamp, grab exactly 1 frame
     const outFile = `frame_${String(i + 1).padStart(2, '0')}.jpg`
 
+    // IMPORTANT: -ss AFTER -i for frame-accurate seek in FFmpeg WASM.
+    // -ss before -i uses keyframe seek and often lands on wrong frame or
+    // produces no output. After -i is slow but accurate and always works.
     const args = [
-      '-ss', timestamp.toFixed(4),
       '-i', inputFilename,
+      '-ss', timestamp.toFixed(4),
       '-vframes', '1',
       '-q:v', '2',
-      '-f', 'image2',
+      '-vsync', '0',
       outFile,
     ]
+
+    console.log(`[Extract] Frame ${i + 1}: -ss ${timestamp.toFixed(4)}`)
 
     try {
       await ffmpeg.exec(args)
     } catch (err) {
-      console.warn(`[Extract] Frame ${i + 1} exec failed:`, err)
-      // Continue — don't abort the whole job for one frame
+      console.warn(`[Extract] exec failed for frame ${i + 1}:`, err)
     }
 
-    // Read the output file
     try {
       const data = await ffmpeg.readFile(outFile)
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -202,26 +193,26 @@ export async function extractFrames(
         blob,
       })
       await ffmpeg.deleteFile(outFile)
+      console.log(`[Extract] Frame ${i + 1} OK`)
     } catch {
-      console.warn(`[Extract] Frame ${i + 1} read failed`)
+      console.warn(`[Extract] Frame ${i + 1} read failed — no output produced`)
     }
 
-    const progress = 10 + Math.floor(((i + 1) / TOTAL_FRAMES) * 88)
     onProgress({
       status: 'extracting',
-      progress,
+      progress: 10 + Math.floor(((i + 1) / TOTAL_FRAMES) * 88),
       currentFrame: i + 1,
       totalFrames: TOTAL_FRAMES,
       message: `Extracting frame ${i + 1} of ${TOTAL_FRAMES}…`,
     })
   }
 
-  // Cleanup input
   try { await ffmpeg.deleteFile(inputFilename) } catch { /* ignore */ }
 
   if (frames.length === 0) {
     throw new Error(
-      'FFmpeg produced 0 frames. The video codec may be unsupported. Try converting to MP4/H.264 first.'
+      'FFmpeg produced 0 frames. Open DevTools console for details. ' +
+      'The video may use an unsupported codec — try re-encoding as MP4/H.264.'
     )
   }
 
@@ -236,8 +227,6 @@ export async function extractFrames(
 
   return frames
 }
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 export function releaseFrames(frames: ExtractedFrame[]): void {
   for (const frame of frames) {
