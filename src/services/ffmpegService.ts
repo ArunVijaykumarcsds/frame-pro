@@ -7,11 +7,12 @@ const TOTAL_FRAMES = 50
 const METADATA_TIMEOUT_MS = 15_000
 const WASM_LOAD_TIMEOUT_MS = 60_000
 
+// Max dimension to cap before extraction — prevents WASM memory crash on 4K videos
+const MAX_DIMENSION = 1920
+
 let ffmpegInstance: FFmpeg | null = null
 let isLoaded = false
 
-// @ffmpeg/core-mt uses SharedArrayBuffer + threads = more stable WASM memory
-// Fall back to single-threaded core if mt fails
 const CDN_CONFIGS = [
   {
     label: 'core-mt 0.12.6 (threaded)',
@@ -92,14 +93,12 @@ export async function loadFFmpeg(
     throw new Error('Failed to load FFmpeg from all sources. Check your internet connection.')
   }
 
-  // Smoke test — run a trivial command to verify WASM exec works
   console.log('[FFmpeg] Running smoke test…')
   try {
     await ffmpeg.exec(['-version'])
     console.log('[FFmpeg] Smoke test passed ✓')
   } catch (err) {
     console.error('[FFmpeg] Smoke test FAILED:', err)
-    // Reset so next call retries
     isLoaded = false
     ffmpegInstance = null
     throw new Error(
@@ -162,6 +161,14 @@ export function getVideoMetadata(file: File): Promise<VideoMetadata> {
   })
 }
 
+// Build a scale filter only when the video exceeds MAX_DIMENSION
+// This prevents WASM memory access out of bounds on 4K+ videos
+function buildScaleFilter(width: number, height: number): string | null {
+  if (width <= MAX_DIMENSION && height <= MAX_DIMENSION) return null
+  // Scale down the larger dimension, keep aspect ratio, ensure even numbers (required by JPEG encoder)
+  return `scale='if(gt(iw,ih),min(${MAX_DIMENSION},iw),-2)':'if(gt(iw,ih),-2,min(${MAX_DIMENSION},ih))'`
+}
+
 export async function extractFrames(
   file: File,
   metadata: VideoMetadata,
@@ -185,9 +192,17 @@ export async function extractFrames(
 
   if (signal?.aborted) throw new Error('Cancelled')
 
-  const { duration } = metadata
+  const { duration, width, height } = metadata
   const interval = duration / TOTAL_FRAMES
   const frames: ExtractedFrame[] = []
+
+  // Build scale filter based on actual video dimensions
+  const scaleFilter = buildScaleFilter(width, height)
+  if (scaleFilter) {
+    console.log(`[Extract] Applying scale filter (${width}x${height} → max ${MAX_DIMENSION}px): ${scaleFilter}`)
+  } else {
+    console.log(`[Extract] No scaling needed (${width}x${height})`)
+  }
 
   console.log(`[Extract] duration=${duration}s interval=${interval.toFixed(4)}s`)
 
@@ -205,10 +220,12 @@ export async function extractFrames(
     const timestamp = i * interval
     const outFile = `frame_${String(i + 1).padStart(2, '0')}.jpg`
 
+    // Only add -vf if video needs scaling — avoids unnecessary re-encode on normal videos
     const args = [
       '-i', inputFilename,
       '-ss', timestamp.toFixed(4),
       '-vframes', '1',
+      ...(scaleFilter ? ['-vf', scaleFilter] : []),
       '-q:v', '2',
       '-vsync', '0',
       outFile,
@@ -225,13 +242,18 @@ export async function extractFrames(
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const uint8 = new Uint8Array((data as any).buffer ?? data)
       const blob = new Blob([uint8], { type: 'image/jpeg' })
+
+      // Use scaled dimensions if we applied a filter, otherwise use original
+      const outWidth = scaleFilter ? Math.min(width, MAX_DIMENSION) : width
+      const outHeight = scaleFilter ? Math.min(height, MAX_DIMENSION) : height
+
       frames.push({
         id: i + 1,
         frameNumber: i + 1,
         timestamp,
         dataUrl: URL.createObjectURL(blob),
-        width: metadata.width,
-        height: metadata.height,
+        width: outWidth,
+        height: outHeight,
         blob,
       })
       await ffmpeg.deleteFile(outFile)
