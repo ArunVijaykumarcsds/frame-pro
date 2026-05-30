@@ -8,7 +8,7 @@ const METADATA_TIMEOUT_MS = 15_000
 const WASM_LOAD_TIMEOUT_MS = 60_000
 
 // Scale down to 720p max — keeps WASM memory safe for high-bitrate 1080p videos
-const MAX_DIMENSION = 1280
+const MAX_DIMENSION = 640
 
 let ffmpegInstance: FFmpeg | null = null
 let isLoaded = false
