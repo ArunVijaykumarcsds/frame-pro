@@ -6,7 +6,9 @@ import { getFrameFilename } from '../utils/format'
 const TOTAL_FRAMES = 50
 const METADATA_TIMEOUT_MS = 15_000
 const WASM_LOAD_TIMEOUT_MS = 60_000
-const MAX_DIMENSION = 1920
+
+// Scale down to 720p max — keeps WASM memory safe for high-bitrate 1080p videos
+const MAX_DIMENSION = 1280
 
 let ffmpegInstance: FFmpeg | null = null
 let isLoaded = false
@@ -159,9 +161,11 @@ export function getVideoMetadata(file: File): Promise<VideoMetadata> {
   })
 }
 
+// Always scale to max 1280px wide / 720px tall to keep WASM memory usage safe.
+// High-bitrate 1080p videos crash WASM with "memory access out of bounds" without this.
 function buildScaleFilter(width: number, height: number): string | null {
-  if (width <= MAX_DIMENSION && height <= MAX_DIMENSION) return null
-  return `scale='if(gt(iw,ih),min(${MAX_DIMENSION},iw),-2)':'if(gt(iw,ih),-2,min(${MAX_DIMENSION},ih))'`
+  if (width <= MAX_DIMENSION && height <= 720) return null
+  return `scale='if(gt(iw,ih),min(${MAX_DIMENSION},iw),-2)':'if(gt(iw,ih),-2,min(720,ih))'`
 }
 
 export async function extractFrames(
@@ -189,7 +193,7 @@ export async function extractFrames(
 
   const { duration, width, height } = metadata
   const interval = duration / TOTAL_FRAMES
-  const frames: ExtractedFrame[] = []
+  const frames: ExtractedFrame[]= []
 
   const fps = TOTAL_FRAMES / duration
   const scaleFilter = buildScaleFilter(width, height)
@@ -198,11 +202,11 @@ export async function extractFrames(
     : `fps=${fps.toFixed(6)}`
 
   const outWidth = scaleFilter ? Math.min(width, MAX_DIMENSION) : width
-  const outHeight = scaleFilter ? Math.min(height, MAX_DIMENSION) : height
+  const outHeight = scaleFilter ? Math.min(height, 720) : height
 
   console.log(`[Extract] duration=${duration}s fps=${fps.toFixed(6)} vf=${vfFilter}`)
   if (scaleFilter) {
-    console.log(`[Extract] Scaling ${width}x${height} → max ${MAX_DIMENSION}px`)
+    console.log(`[Extract] Scaling ${width}x${height} → max ${MAX_DIMENSION}x720`)
   }
 
   onProgress({
@@ -213,10 +217,9 @@ export async function extractFrames(
     currentFrame: 0,
   })
 
-  // Single-pass extraction — runs one FFmpeg command instead of 50 individual seeks.
-  // This is 10-20x faster and avoids freezing on codecs like MJPEG that require
-  // decoding from the start on every seek.
-const args = [
+  // Single-pass extraction — one FFmpeg command instead of 50 individual seeks.
+  // 10-20x faster and avoids freezing on slow-seeking codecs like MJPEG.
+  const args = [
     '-threads', '4',
     '-skip_frame', 'noref',
     '-i', inputFilename,
@@ -227,7 +230,6 @@ const args = [
     'frame_%02d.jpg',
   ]
 
-  // Wire up progress reporting from FFmpeg's own progress events
   const progressHandler = ({ progress }: { progress: number }) => {
     if (signal?.aborted) return
     const pct = Math.floor(10 + (Math.min(progress, 1) * 85))
@@ -258,7 +260,6 @@ const args = [
 
   if (signal?.aborted) throw new Error('Cancelled')
 
-  // Read all output frames from WASM virtual filesystem
   onProgress({
     status: 'extracting',
     message: 'Reading extracted frames…',
