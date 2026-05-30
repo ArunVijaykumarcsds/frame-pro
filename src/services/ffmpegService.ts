@@ -5,55 +5,85 @@ import { getFrameFilename } from '../utils/format'
 
 const TOTAL_FRAMES = 50
 const METADATA_TIMEOUT_MS = 15_000
+const WASM_LOAD_TIMEOUT_MS = 30_000
 
 let ffmpegInstance: FFmpeg | null = null
 let isLoaded = false
 
-// ─── 1. loadFFmpeg ────────────────────────────────────────────────────────────
+// ─── CDN list – tried in order until one works ────────────────────────────────
+const CDN_BASES = [
+  'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/esm',
+  'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm',
+]
 
-/**
- * Load FFmpeg WASM (singleton – load once, reuse).
- * Logs every major step so network/WASM failures are visible in the console.
- */
+async function loadFromCDN(base: string): Promise<{ coreURL: string; wasmURL: string }> {
+  console.log('[FFmpeg] Trying CDN:', base)
+  const coreURL = await toBlobURL(`${base}/ffmpeg-core.js`, 'text/javascript')
+  console.log('[FFmpeg] core JS blob ready')
+  const wasmURL = await toBlobURL(`${base}/ffmpeg-core.wasm`, 'application/wasm')
+  console.log('[FFmpeg] WASM blob ready')
+  return { coreURL, wasmURL }
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${ms / 1000}s`))
+    }, ms)
+    promise.then(
+      (v) => { clearTimeout(t); resolve(v) },
+      (e) => { clearTimeout(t); reject(e) }
+    )
+  })
+}
+
+// ─── loadFFmpeg ───────────────────────────────────────────────────────────────
+
 export async function loadFFmpeg(
   onProgress?: (state: Partial<ProcessingState>) => void
 ): Promise<FFmpeg> {
   if (ffmpegInstance && isLoaded) {
-    console.log('[FFmpeg] Already loaded – reusing singleton')
+    console.log('[FFmpeg] Reusing loaded instance')
     return ffmpegInstance
   }
 
-  console.log('[FFmpeg] Starting load…')
+  console.log('[FFmpeg] Loading engine…')
   onProgress?.({ status: 'loading-ffmpeg', message: 'Loading FFmpeg engine…', progress: 0 })
 
   const ffmpeg = new FFmpeg()
+  ffmpeg.on('log', ({ type, message }) => console.log(`[FFmpeg:${type}]`, message))
 
-  // Mirror ffmpeg internal log to the browser console
-  ffmpeg.on('log', ({ type, message }) => {
-    console.log(`[FFmpeg log:${type}]`, message)
-  })
+  // Try each CDN with a hard timeout
+  let urls: { coreURL: string; wasmURL: string } | null = null
+  for (const base of CDN_BASES) {
+    try {
+      urls = await withTimeout(loadFromCDN(base), WASM_LOAD_TIMEOUT_MS, `CDN fetch (${base})`)
+      break
+    } catch (err) {
+      console.warn('[FFmpeg] CDN failed, trying next:', err)
+    }
+  }
 
-  // Use the jsdelivr CDN which is more reliable than unpkg for large WASM files
-  // and does not require SharedArrayBuffer for the core JS itself.
-  const baseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/esm'
+  if (!urls) {
+    throw new Error(
+      'Failed to download FFmpeg WASM from all CDNs. ' +
+      'Check your internet connection. If on a corporate/school network, ' +
+      'jsdelivr.net or unpkg.com may be blocked.'
+    )
+  }
 
-  console.log('[FFmpeg] Fetching core JS from:', `${baseURL}/ffmpeg-core.js`)
-  console.log('[FFmpeg] Fetching WASM from:   ', `${baseURL}/ffmpeg-core.wasm`)
+  console.log('[FFmpeg] Calling ffmpeg.load()…')
+  onProgress?.({ message: 'Initialising FFmpeg engine…', progress: 3 })
 
   try {
-    const coreURL = await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript')
-    console.log('[FFmpeg] core JS blob URL ready:', coreURL.slice(0, 60))
-
-    const wasmURL = await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm')
-    console.log('[FFmpeg] WASM blob URL ready:   ', wasmURL.slice(0, 60))
-
-    await ffmpeg.load({ coreURL, wasmURL })
-    console.log('[FFmpeg] ffmpeg.load() resolved – engine is ready')
+    await withTimeout(ffmpeg.load(urls), WASM_LOAD_TIMEOUT_MS, 'ffmpeg.load()')
+    console.log('[FFmpeg] ffmpeg.load() complete ✓')
   } catch (err) {
-    console.error('[FFmpeg] Failed to load FFmpeg WASM:', err)
+    console.error('[FFmpeg] ffmpeg.load() failed:', err)
     throw new Error(
-      'Failed to load the FFmpeg engine. Check your internet connection and that ' +
-      'the site is served with Cross-Origin-Opener-Policy / Cross-Origin-Embedder-Policy headers.'
+      'FFmpeg WASM initialisation failed. ' +
+      'This site requires Cross-Origin-Opener-Policy and Cross-Origin-Embedder-Policy headers. ' +
+      'On Render, ensure render.yaml has the correct headers block. Error: ' + String(err)
     )
   }
 
@@ -62,43 +92,23 @@ export async function loadFFmpeg(
   return ffmpeg
 }
 
-// ─── 2. getVideoMetadata ──────────────────────────────────────────────────────
+// ─── getVideoMetadata ─────────────────────────────────────────────────────────
 
-/**
- * Get video duration + resolution via a native <video> element.
- *
- * Brave (and other privacy-focused browsers) sometimes block
- * onloadedmetadata when the video codec is unsupported, or when
- * the browser's media pipeline stalls.  We defend against that with:
- *   - an explicit video.load() call after setting src
- *   - a 15-second hard timeout
- *   - detailed console logging at every decision point
- */
 export function getVideoMetadata(file: File): Promise<VideoMetadata> {
   return new Promise((resolve, reject) => {
-    console.log('[Metadata] Creating object URL for:', file.name, `(${file.size} bytes, type="${file.type}")`)
+    console.log('[Metadata] File:', file.name, file.size, 'bytes, type:', file.type)
     const url = URL.createObjectURL(file)
     const video = document.createElement('video')
-
-    // Essential for Brave / Firefox: muted + playsInline prevents autoplay
-    // policies from blocking the media pipeline entirely.
     video.muted = true
     video.playsInline = true
     video.preload = 'metadata'
-    video.crossOrigin = 'anonymous'
 
-    // ── 15-second timeout ──────────────────────────────────────────────────
     const timer = setTimeout(() => {
-      console.error('[Metadata] TIMEOUT – onloadedmetadata did not fire within 15 s')
-      console.error('[Metadata] readyState at timeout:', video.readyState,
-        '(0=HAVE_NOTHING,1=HAVE_METADATA,2=HAVE_CURRENT_DATA,3=HAVE_FUTURE_DATA,4=HAVE_ENOUGH_DATA)')
-      console.error('[Metadata] networkState at timeout:', video.networkState,
-        '(0=EMPTY,1=IDLE,2=LOADING,3=NO_SOURCE)')
+      console.error('[Metadata] TIMEOUT – readyState:', video.readyState, 'networkState:', video.networkState)
       cleanup()
       reject(new Error(
-        'Video metadata timed out after 15 seconds. ' +
-        'The browser may not support this codec, or the file may be corrupted. ' +
-        `readyState=${video.readyState}, networkState=${video.networkState}`
+        `Video metadata timed out after 15s. readyState=${video.readyState}, networkState=${video.networkState}. ` +
+        'Try a different file or format (MP4/H.264 works best).'
       ))
     }, METADATA_TIMEOUT_MS)
 
@@ -106,26 +116,16 @@ export function getVideoMetadata(file: File): Promise<VideoMetadata> {
       clearTimeout(timer)
       video.onloadedmetadata = null
       video.onerror = null
-      video.oncanplay = null
       URL.revokeObjectURL(url)
     }
 
-    // ── Success ────────────────────────────────────────────────────────────
     video.onloadedmetadata = () => {
-      console.log('[Metadata] onloadedmetadata fired ✓')
-      console.log('[Metadata] duration:', video.duration, 's')
-      console.log('[Metadata] videoWidth:', video.videoWidth, '  videoHeight:', video.videoHeight)
-      console.log('[Metadata] readyState:', video.readyState)
-
+      console.log('[Metadata] ✓ duration:', video.duration, 'size:', video.videoWidth, '×', video.videoHeight)
       if (!video.duration || !isFinite(video.duration)) {
         cleanup()
-        reject(new Error(
-          'Could not determine video duration (got: ' + video.duration + '). ' +
-          'The file may be corrupted or use an unsupported container.'
-        ))
+        reject(new Error('Video duration is invalid (' + video.duration + '). File may be corrupted.'))
         return
       }
-
       cleanup()
       resolve({
         name: file.name,
@@ -137,221 +137,134 @@ export function getVideoMetadata(file: File): Promise<VideoMetadata> {
       })
     }
 
-    // ── Fallback: some browsers fire canplay before loadedmetadata ─────────
-    video.oncanplay = () => {
-      console.log('[Metadata] oncanplay fired (fallback check)')
-      if (video.readyState >= 1 && video.duration && isFinite(video.duration)) {
-        console.log('[Metadata] Resolving from oncanplay fallback')
-        video.onloadedmetadata?.(new Event('loadedmetadata'))
-      }
-    }
-
-    // ── Error ──────────────────────────────────────────────────────────────
-    video.onerror = (e) => {
-      const code = (video.error?.code ?? 'unknown')
-      const msg  = (video.error?.message ?? String(e))
-      console.error('[Metadata] video.onerror – code:', code, 'message:', msg)
+    video.onerror = () => {
+      const code = video.error?.code ?? '?'
+      const msg = video.error?.message ?? 'unknown'
+      console.error('[Metadata] video.onerror code:', code, msg)
       cleanup()
-      reject(new Error(
-        `Browser rejected the video file (MediaError code ${code}: ${msg}). ` +
-        'Try a different format (MP4/H.264 is best supported).'
-      ))
+      reject(new Error(`Browser could not read video (MediaError ${code}: ${msg}). Try MP4/H.264 format.`))
     }
 
-    // ── Assign src and explicitly call load() ──────────────────────────────
-    console.log('[Metadata] Setting video.src and calling video.load()')
     video.src = url
-    video.load() // required in some browsers to start the pipeline
+    video.load()
   })
 }
 
-// ─── 3. extractFrames ─────────────────────────────────────────────────────────
+// ─── extractFrames ────────────────────────────────────────────────────────────
 
-/**
- * Extract exactly 50 frames from a video file using FFmpeg WASM.
- */
 export async function extractFrames(
   file: File,
   metadata: VideoMetadata,
   onProgress: (state: Partial<ProcessingState>) => void,
   signal?: AbortSignal
 ): Promise<ExtractedFrame[]> {
-  console.log('[Extract] Starting extraction for:', file.name)
-  console.log('[Extract] metadata:', metadata)
+  console.log('[Extract] Starting:', file.name, metadata)
 
   const ffmpeg = await loadFFmpeg(onProgress)
+  if (signal?.aborted) throw new Error('Cancelled')
 
-  if (signal?.aborted) throw new Error('Operation cancelled')
+  onProgress({ status: 'analyzing', message: 'Preparing video…', progress: 5 })
 
-  onProgress({ status: 'analyzing', message: 'Preparing video for extraction…', progress: 5 })
-
-  // ── Write input file to FFmpeg virtual FS ──────────────────────────────
   const inputFilename = 'input_video' + getExtension(file.name)
-  console.log('[Extract] Fetching file data for writeFile…')
-  const fileData = await fetchFile(file)
-  console.log('[Extract] fileData length:', fileData.length, 'bytes')
 
-  console.log('[Extract] ffmpeg.writeFile() →', inputFilename)
+  console.log('[Extract] fetchFile…')
+  const fileData = await fetchFile(file)
+  console.log('[Extract] fetchFile done, bytes:', fileData.length)
+
+  console.log('[Extract] writeFile →', inputFilename)
   try {
     await ffmpeg.writeFile(inputFilename, fileData)
-    console.log('[Extract] writeFile() complete ✓')
+    console.log('[Extract] writeFile ✓')
   } catch (err) {
-    console.error('[Extract] writeFile() FAILED:', err)
-    throw new Error('Failed to write video to FFmpeg virtual filesystem: ' + String(err))
+    throw new Error('Failed to write video to FFmpeg virtual FS: ' + String(err))
   }
 
-  if (signal?.aborted) throw new Error('Operation cancelled')
+  if (signal?.aborted) throw new Error('Cancelled')
 
   const { duration, width, height } = metadata
-
-  // fps = 50 / total_seconds → exactly 50 frames over full duration
   const fps = TOTAL_FRAMES / duration
-  console.log(`[Extract] duration=${duration}s  fps=${fps.toFixed(6)}  expecting ${TOTAL_FRAMES} frames`)
-  console.log(`[Extract] resolution: ${width}×${height}`)
 
-  onProgress({
-    status: 'extracting',
-    message: `Extracting ${TOTAL_FRAMES} frames…`,
-    progress: 10,
-    totalFrames: TOTAL_FRAMES,
-    currentFrame: 0,
-  })
+  console.log(`[Extract] fps=${fps.toFixed(6)}, resolution=${width}×${height}`)
 
-  // ── FFmpeg progress listener ───────────────────────────────────────────
+  onProgress({ status: 'extracting', message: `Extracting ${TOTAL_FRAMES} frames…`, progress: 10, totalFrames: TOTAL_FRAMES, currentFrame: 0 })
+
   const progressHandler = ({ progress }: { progress: number }) => {
     if (signal?.aborted) return
     const pct = 10 + Math.floor(Math.min(progress, 1) * 80)
-    const currentFrame = Math.floor(Math.min(progress, 1) * TOTAL_FRAMES)
-    onProgress({
-      status: 'extracting',
-      progress: pct,
-      currentFrame,
-      message: `Extracting frame ${currentFrame} of ${TOTAL_FRAMES}…`,
-    })
+    const cur = Math.floor(Math.min(progress, 1) * TOTAL_FRAMES)
+    onProgress({ status: 'extracting', progress: pct, currentFrame: cur, message: `Extracting frame ${cur} of ${TOTAL_FRAMES}…` })
   }
   ffmpeg.on('progress', progressHandler)
 
-  // ── Build FFmpeg args ─────────────────────────────────────────────────
-  // FIX: removed the duplicate -vf flag that caused FFmpeg to error/silently
-  // fail. Only one -vf filter chain is allowed.  If width/height are unknown
-  // (0) we skip the scale filter to avoid a "0×0" error.
+  // Single -vf flag (was duplicated before — that caused silent failure)
   const vfFilter = (width > 0 && height > 0)
     ? `fps=${fps},scale=${width}:${height}`
     : `fps=${fps}`
 
-  const ffmpegArgs = [
-    '-i', inputFilename,
-    '-vf', vfFilter,
-    '-frames:v', String(TOTAL_FRAMES),
-    '-q:v', '2',            // near-max JPEG quality (1–31, lower = better)
-    'frame_%02d.jpg',
-  ]
-
-  console.log('[Extract] ffmpeg.exec() args:', ffmpegArgs.join(' '))
+  const args = ['-i', inputFilename, '-vf', vfFilter, '-frames:v', String(TOTAL_FRAMES), '-q:v', '2', 'frame_%02d.jpg']
+  console.log('[Extract] ffmpeg.exec:', args.join(' '))
 
   try {
-    await ffmpeg.exec(ffmpegArgs)
-    console.log('[Extract] ffmpeg.exec() complete ✓')
+    await ffmpeg.exec(args)
+    console.log('[Extract] ffmpeg.exec ✓')
   } catch (err) {
-    console.error('[Extract] ffmpeg.exec() FAILED:', err)
     ffmpeg.off('progress', progressHandler)
-    throw new Error('FFmpeg frame extraction failed: ' + String(err))
+    throw new Error('FFmpeg exec failed: ' + String(err))
   }
 
   ffmpeg.off('progress', progressHandler)
+  if (signal?.aborted) throw new Error('Cancelled')
 
-  if (signal?.aborted) throw new Error('Operation cancelled')
+  onProgress({ status: 'extracting', message: 'Reading frames…', progress: 92 })
 
-  onProgress({ status: 'extracting', message: 'Reading extracted frames…', progress: 92 })
-
-  // ── Read output frames ────────────────────────────────────────────────
   const frames: ExtractedFrame[] = []
   const secondsPerFrame = duration / TOTAL_FRAMES
 
   for (let i = 1; i <= TOTAL_FRAMES; i++) {
-    if (signal?.aborted) throw new Error('Operation cancelled')
-
+    if (signal?.aborted) throw new Error('Cancelled')
     const filename = `frame_${String(i).padStart(2, '0')}.jpg`
-
     try {
-    const data = await ffmpeg.readFile(filename)
-
-    const arrayBuffer = (data as Uint8Array).slice().buffer
-
-    const blob = new Blob(
-      [arrayBuffer],
-      { type: 'image/jpeg' }
-      )
-      const dataUrl = URL.createObjectURL(blob)
-
+      const data = await ffmpeg.readFile(filename)
+      const blob = new Blob([data], { type: 'image/jpeg' })
       frames.push({
         id: i,
         frameNumber: i,
         timestamp: (i - 1) * secondsPerFrame,
-        dataUrl,
+        dataUrl: URL.createObjectURL(blob),
         width,
         height,
         blob,
       })
-
       await ffmpeg.deleteFile(filename)
-    } catch (err) {
-      console.warn(`[Extract] Frame ${i} (${filename}) not found – skipping:`, err)
+    } catch {
+      console.warn('[Extract] Missing frame', i)
     }
-
-    onProgress({
-      status: 'extracting',
-      progress: 92 + Math.floor((i / TOTAL_FRAMES) * 7),
-      currentFrame: i,
-      message: `Loading frame ${i} of ${TOTAL_FRAMES}…`,
-    })
+    onProgress({ status: 'extracting', progress: 92 + Math.floor((i / TOTAL_FRAMES) * 7), currentFrame: i, message: `Loading frame ${i} of ${TOTAL_FRAMES}…` })
   }
 
-  console.log(`[Extract] ${frames.length} frames loaded`)
-
-  // ── Cleanup input ─────────────────────────────────────────────────────
-  try {
-    await ffmpeg.deleteFile(inputFilename)
-  } catch {
-    // ignore cleanup errors
-  }
+  try { await ffmpeg.deleteFile(inputFilename) } catch { /* ignore */ }
 
   if (frames.length === 0) {
-    throw new Error(
-      'FFmpeg ran but produced no output frames. ' +
-      'The video codec may be unsupported by FFmpeg WASM, or the file is corrupted.'
-    )
+    throw new Error('FFmpeg ran but produced 0 frames. The codec may be unsupported or the file is corrupted.')
   }
 
-  onProgress({
-    status: 'complete',
-    progress: 100,
-    currentFrame: frames.length,
-    totalFrames: frames.length,
-    message: `Successfully extracted ${frames.length} frames`,
-  })
+  console.log(`[Extract] Done – ${frames.length} frames`)
+  onProgress({ status: 'complete', progress: 100, currentFrame: frames.length, totalFrames: frames.length, message: `Extracted ${frames.length} frames` })
 
-  console.log('[Extract] Done ✓')
   return frames
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-/**
- * Free object URLs for extracted frames to prevent memory leaks.
- */
 export function releaseFrames(frames: ExtractedFrame[]): void {
   for (const frame of frames) {
-    if (frame.dataUrl.startsWith('blob:')) {
-      URL.revokeObjectURL(frame.dataUrl)
-    }
+    if (frame.dataUrl.startsWith('blob:')) URL.revokeObjectURL(frame.dataUrl)
   }
 }
 
 function getExtension(filename: string): string {
   const parts = filename.split('.')
-  if (parts.length > 1) return '.' + parts.pop()!.toLowerCase()
-  return '.mp4'
+  return parts.length > 1 ? '.' + parts.pop()!.toLowerCase() : '.mp4'
 }
 
 export function getDownloadFilename(videoName: string, frameNumber: number): string {
