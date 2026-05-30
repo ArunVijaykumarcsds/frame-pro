@@ -137,7 +137,8 @@ export async function extractFrames(
 
     try {
       const data = await ffmpeg.readFile(filename)
-      const blob = new Blob([data], { type: 'image/jpeg' })
+      const uint8Array = data as Uint8Array
+      const blob = new Blob([uint8Array], { type: 'image/jpeg' })
       const dataUrl = URL.createObjectURL(blob)
 
       frames.push({
