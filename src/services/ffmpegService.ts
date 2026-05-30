@@ -216,11 +216,13 @@ export async function extractFrames(
   // Single-pass extraction — runs one FFmpeg command instead of 50 individual seeks.
   // This is 10-20x faster and avoids freezing on codecs like MJPEG that require
   // decoding from the start on every seek.
-  const args = [
+const args = [
+    '-threads', '4',
+    '-skip_frame', 'noref',
     '-i', inputFilename,
     '-vf', vfFilter,
     '-frames:v', String(TOTAL_FRAMES),
-    '-q:v', '2',
+    '-q:v', '3',
     '-vsync', '0',
     'frame_%02d.jpg',
   ]
