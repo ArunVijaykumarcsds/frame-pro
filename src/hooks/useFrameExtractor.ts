@@ -27,34 +27,32 @@ export function useFrameExtractor() {
   const selectVideo = useCallback(async (file: File) => {
     setValidationError(null)
 
-    // Validate
     const validation = validateVideoFile(file)
     if (!validation.valid) {
       setValidationError(validation.error!)
       return
     }
 
-    // Release previous frames memory
-    setFrames((prev) => {
-      releaseFrames(prev)
-      return []
-    })
-
+    setFrames((prev) => { releaseFrames(prev); return [] })
     setVideoFile(file)
     setMetadata(null)
-    setProcessing(INITIAL_PROCESSING_STATE)
+
+    // Use a local 'loading' status just for the brief metadata read.
+    // When done we reset to 'idle' so VideoInfo panel renders correctly.
+    setProcessing({ ...INITIAL_PROCESSING_STATE, status: 'analyzing', message: 'Reading video metadata…', progress: 2 })
 
     try {
-      updateProcessing({ status: 'analyzing', message: 'Reading video metadata…', progress: 2 })
       const meta = await getVideoMetadata(file)
       setMetadata(meta)
+      // ← CRITICAL FIX: reset back to idle so HomePage shows VideoInfo, not ProcessingPanel
+      setProcessing(INITIAL_PROCESSING_STATE)
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Failed to read video file'
       setValidationError(msg)
       setVideoFile(null)
       setProcessing(INITIAL_PROCESSING_STATE)
     }
-  }, [updateProcessing])
+  }, [])
 
   const startExtraction = useCallback(async () => {
     if (!videoFile || !metadata) return
@@ -78,11 +76,8 @@ export function useFrameExtractor() {
     } catch (err) {
       if (controller.signal.aborted) return
       const msg = err instanceof Error ? err.message : 'An unexpected error occurred during extraction'
-      updateProcessing({
-        status: 'error',
-        error: msg,
-        message: msg,
-      })
+      console.error('[useFrameExtractor] extraction error:', msg)
+      updateProcessing({ status: 'error', error: msg, message: msg })
     }
   }, [videoFile, metadata, updateProcessing])
 
