@@ -5,15 +5,32 @@ import { getFrameFilename } from '../utils/format'
 
 const TOTAL_FRAMES = 50
 const METADATA_TIMEOUT_MS = 15_000
-const WASM_LOAD_TIMEOUT_MS = 40_000
+const WASM_LOAD_TIMEOUT_MS = 60_000
 
 let ffmpegInstance: FFmpeg | null = null
 let isLoaded = false
 
-const CDN_BASES = [
-  'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.9/dist/esm',
-  'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/esm',
-  'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm',
+// @ffmpeg/core-mt uses SharedArrayBuffer + threads = more stable WASM memory
+// Fall back to single-threaded core if mt fails
+const CDN_CONFIGS = [
+  {
+    label: 'core-mt 0.12.6 (threaded)',
+    coreJS: 'https://cdn.jsdelivr.net/npm/@ffmpeg/core-mt@0.12.6/dist/esm/ffmpeg-core.js',
+    coreWASM: 'https://cdn.jsdelivr.net/npm/@ffmpeg/core-mt@0.12.6/dist/esm/ffmpeg-core.wasm',
+    coreWorker: 'https://cdn.jsdelivr.net/npm/@ffmpeg/core-mt@0.12.6/dist/esm/ffmpeg-core.worker.js',
+  },
+  {
+    label: 'core 0.12.6 jsdelivr',
+    coreJS: 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/esm/ffmpeg-core.js',
+    coreWASM: 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/esm/ffmpeg-core.wasm',
+    coreWorker: null,
+  },
+  {
+    label: 'core 0.12.6 unpkg',
+    coreJS: 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm/ffmpeg-core.js',
+    coreWASM: 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm/ffmpeg-core.wasm',
+    coreWorker: null,
+  },
 ]
 
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
@@ -37,26 +54,59 @@ export async function loadFFmpeg(
   console.log('[FFmpeg] Loading…')
   onProgress?.({ status: 'loading-ffmpeg', message: 'Loading FFmpeg engine…', progress: 0 })
 
-  const ffmpeg = new FFmpeg()
-  ffmpeg.on('log', ({ type, message }) => console.log(`[FFmpeg:${type}]`, message))
-
   let loaded = false
-  for (const base of CDN_BASES) {
+  let ffmpeg!: FFmpeg
+
+  for (const cfg of CDN_CONFIGS) {
     try {
-      console.log('[FFmpeg] Trying:', base)
-      const coreURL = await withTimeout(toBlobURL(`${base}/ffmpeg-core.js`, 'text/javascript'), WASM_LOAD_TIMEOUT_MS, 'core JS')
-      const wasmURL = await withTimeout(toBlobURL(`${base}/ffmpeg-core.wasm`, 'application/wasm'), WASM_LOAD_TIMEOUT_MS, 'core WASM')
-      await withTimeout(ffmpeg.load({ coreURL, wasmURL }), WASM_LOAD_TIMEOUT_MS, 'ffmpeg.load')
-      console.log('[FFmpeg] Loaded OK from:', base)
+      console.log('[FFmpeg] Trying:', cfg.label)
+      ffmpeg = new FFmpeg()
+      ffmpeg.on('log', ({ type, message }) => console.log(`[FFmpeg:${type}]`, message))
+
+      const coreURL = await withTimeout(
+        toBlobURL(cfg.coreJS, 'text/javascript'), WASM_LOAD_TIMEOUT_MS, 'coreJS'
+      )
+      const wasmURL = await withTimeout(
+        toBlobURL(cfg.coreWASM, 'application/wasm'), WASM_LOAD_TIMEOUT_MS, 'coreWASM'
+      )
+
+      const loadConfig: Record<string, string> = { coreURL, wasmURL }
+
+      if (cfg.coreWorker) {
+        const workerURL = await withTimeout(
+          toBlobURL(cfg.coreWorker, 'text/javascript'), WASM_LOAD_TIMEOUT_MS, 'workerJS'
+        )
+        loadConfig.workerURL = workerURL
+      }
+
+      await withTimeout(ffmpeg.load(loadConfig), WASM_LOAD_TIMEOUT_MS, 'ffmpeg.load')
+      console.log('[FFmpeg] Loaded OK:', cfg.label)
       loaded = true
       break
     } catch (err) {
-      console.warn('[FFmpeg] CDN failed:', base, err)
+      console.warn('[FFmpeg] Failed:', cfg.label, String(err))
     }
   }
 
   if (!loaded) {
-    throw new Error('Failed to load FFmpeg from all CDNs. Check COOP/COEP headers and internet connection.')
+    throw new Error('Failed to load FFmpeg from all sources. Check your internet connection.')
+  }
+
+  // Smoke test — run a trivial command to verify WASM exec works
+  console.log('[FFmpeg] Running smoke test…')
+  try {
+    await ffmpeg.exec(['-version'])
+    console.log('[FFmpeg] Smoke test passed ✓')
+  } catch (err) {
+    console.error('[FFmpeg] Smoke test FAILED:', err)
+    // Reset so next call retries
+    isLoaded = false
+    ffmpegInstance = null
+    throw new Error(
+      'FFmpeg loaded but exec() crashes immediately (RuntimeError: memory access out of bounds). ' +
+      'This is a known issue with @ffmpeg/core in Brave browser with Shields up. ' +
+      'Try: (1) Disable Brave Shields for this site, or (2) Use Chrome/Edge instead.'
+    )
   }
 
   ffmpegInstance = ffmpeg
@@ -75,7 +125,7 @@ export function getVideoMetadata(file: File): Promise<VideoMetadata> {
 
     const timer = setTimeout(() => {
       cleanup()
-      reject(new Error(`Metadata timeout. readyState=${video.readyState} networkState=${video.networkState}`))
+      reject(new Error(`Metadata timeout. readyState=${video.readyState}`))
     }, METADATA_TIMEOUT_MS)
 
     function cleanup() {
@@ -86,10 +136,9 @@ export function getVideoMetadata(file: File): Promise<VideoMetadata> {
     }
 
     video.onloadedmetadata = () => {
-      console.log('[Metadata] duration:', video.duration, 'size:', video.videoWidth, 'x', video.videoHeight)
       if (!video.duration || !isFinite(video.duration)) {
         cleanup()
-        reject(new Error('Invalid video duration: ' + video.duration))
+        reject(new Error('Invalid duration: ' + video.duration))
         return
       }
       cleanup()
@@ -130,17 +179,15 @@ export async function extractFrames(
   const inputFilename = `input${ext}`
 
   const fileData = await fetchFile(file)
-  console.log('[Extract] Bytes in memory:', fileData.length)
-
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   await ffmpeg.writeFile(inputFilename, fileData as any)
-  console.log('[Extract] writeFile OK')
+  console.log('[Extract] writeFile OK, bytes:', fileData.length)
 
   if (signal?.aborted) throw new Error('Cancelled')
 
   const { duration } = metadata
-  const frames: ExtractedFrame[] = []
   const interval = duration / TOTAL_FRAMES
+  const frames: ExtractedFrame[] = []
 
   console.log(`[Extract] duration=${duration}s interval=${interval.toFixed(4)}s`)
 
@@ -158,9 +205,6 @@ export async function extractFrames(
     const timestamp = i * interval
     const outFile = `frame_${String(i + 1).padStart(2, '0')}.jpg`
 
-    // IMPORTANT: -ss AFTER -i for frame-accurate seek in FFmpeg WASM.
-    // -ss before -i uses keyframe seek and often lands on wrong frame or
-    // produces no output. After -i is slow but accurate and always works.
     const args = [
       '-i', inputFilename,
       '-ss', timestamp.toFixed(4),
@@ -170,12 +214,10 @@ export async function extractFrames(
       outFile,
     ]
 
-    console.log(`[Extract] Frame ${i + 1}: -ss ${timestamp.toFixed(4)}`)
-
     try {
       await ffmpeg.exec(args)
     } catch (err) {
-      console.warn(`[Extract] exec failed for frame ${i + 1}:`, err)
+      console.warn(`[Extract] exec failed frame ${i + 1}:`, err)
     }
 
     try {
@@ -193,9 +235,8 @@ export async function extractFrames(
         blob,
       })
       await ffmpeg.deleteFile(outFile)
-      console.log(`[Extract] Frame ${i + 1} OK`)
     } catch {
-      console.warn(`[Extract] Frame ${i + 1} read failed — no output produced`)
+      console.warn(`[Extract] read failed frame ${i + 1}`)
     }
 
     onProgress({
@@ -211,8 +252,9 @@ export async function extractFrames(
 
   if (frames.length === 0) {
     throw new Error(
-      'FFmpeg produced 0 frames. Open DevTools console for details. ' +
-      'The video may use an unsupported codec — try re-encoding as MP4/H.264.'
+      'FFmpeg produced 0 frames. ' +
+      'If using Brave, disable Shields for this site and try again. ' +
+      'Otherwise try Chrome or Edge.'
     )
   }
 
