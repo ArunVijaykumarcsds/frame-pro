@@ -11,6 +11,9 @@ services:
       - path: /*
         name: Cross-Origin-Embedder-Policy
         value: require-corp
+      - path: /*
+        name: Content-Security-Policy
+        value: "default-src 'self'; script-src 'self' 'unsafe-eval' 'wasm-unsafe-eval' blob: https://cdn.jsdelivr.net https://unpkg.com; worker-src 'self' blob:; connect-src 'self' blob: https://cdn.jsdelivr.net https://unpkg.com; img-src 'self' blob: data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; media-src 'self' blob:;"
     routes:
       - type: rewrite
         source: /*
