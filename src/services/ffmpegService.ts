@@ -173,7 +173,8 @@ export async function extractFrames(
 
   console.log('[Extract] writeFile →', inputFilename)
   try {
-    await ffmpeg.writeFile(inputFilename, fileData as Uint8Array)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await ffmpeg.writeFile(inputFilename, fileData as any)
     console.log('[Extract] writeFile ✓')
   } catch (err) {
     throw new Error('Failed to write video to FFmpeg virtual FS: ' + String(err))
@@ -225,7 +226,8 @@ export async function extractFrames(
     const filename = `frame_${String(i).padStart(2, '0')}.jpg`
     try {
       const data = await ffmpeg.readFile(filename)
-      const blob = new Blob([data as Uint8Array], { type: 'image/jpeg' })
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const blob = new Blob([new Uint8Array((data as any).buffer ?? data)], { type: 'image/jpeg' })
       frames.push({
         id: i,
         frameNumber: i,
