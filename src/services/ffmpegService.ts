@@ -6,8 +6,6 @@ import { getFrameFilename } from '../utils/format'
 const TOTAL_FRAMES = 50
 const METADATA_TIMEOUT_MS = 15_000
 const WASM_LOAD_TIMEOUT_MS = 60_000
-
-// Max dimension to cap before extraction — prevents WASM memory crash on 4K videos
 const MAX_DIMENSION = 1920
 
 let ffmpegInstance: FFmpeg | null = null
@@ -161,11 +159,8 @@ export function getVideoMetadata(file: File): Promise<VideoMetadata> {
   })
 }
 
-// Build a scale filter only when the video exceeds MAX_DIMENSION
-// This prevents WASM memory access out of bounds on 4K+ videos
 function buildScaleFilter(width: number, height: number): string | null {
   if (width <= MAX_DIMENSION && height <= MAX_DIMENSION) return null
-  // Scale down the larger dimension, keep aspect ratio, ensure even numbers (required by JPEG encoder)
   return `scale='if(gt(iw,ih),min(${MAX_DIMENSION},iw),-2)':'if(gt(iw,ih),-2,min(${MAX_DIMENSION},ih))'`
 }
 
@@ -196,15 +191,19 @@ export async function extractFrames(
   const interval = duration / TOTAL_FRAMES
   const frames: ExtractedFrame[] = []
 
-  // Build scale filter based on actual video dimensions
+  const fps = TOTAL_FRAMES / duration
   const scaleFilter = buildScaleFilter(width, height)
-  if (scaleFilter) {
-    console.log(`[Extract] Applying scale filter (${width}x${height} → max ${MAX_DIMENSION}px): ${scaleFilter}`)
-  } else {
-    console.log(`[Extract] No scaling needed (${width}x${height})`)
-  }
+  const vfFilter = scaleFilter
+    ? `fps=${fps.toFixed(6)},${scaleFilter}`
+    : `fps=${fps.toFixed(6)}`
 
-  console.log(`[Extract] duration=${duration}s interval=${interval.toFixed(4)}s`)
+  const outWidth = scaleFilter ? Math.min(width, MAX_DIMENSION) : width
+  const outHeight = scaleFilter ? Math.min(height, MAX_DIMENSION) : height
+
+  console.log(`[Extract] duration=${duration}s fps=${fps.toFixed(6)} vf=${vfFilter}`)
+  if (scaleFilter) {
+    console.log(`[Extract] Scaling ${width}x${height} → max ${MAX_DIMENSION}px`)
+  }
 
   onProgress({
     status: 'extracting',
@@ -214,43 +213,69 @@ export async function extractFrames(
     currentFrame: 0,
   })
 
-  for (let i = 0; i < TOTAL_FRAMES; i++) {
-    if (signal?.aborted) throw new Error('Cancelled')
+  // Single-pass extraction — runs one FFmpeg command instead of 50 individual seeks.
+  // This is 10-20x faster and avoids freezing on codecs like MJPEG that require
+  // decoding from the start on every seek.
+  const args = [
+    '-i', inputFilename,
+    '-vf', vfFilter,
+    '-frames:v', String(TOTAL_FRAMES),
+    '-q:v', '2',
+    '-vsync', '0',
+    'frame_%02d.jpg',
+  ]
 
-    const timestamp = i * interval
-    const outFile = `frame_${String(i + 1).padStart(2, '0')}.jpg`
+  // Wire up progress reporting from FFmpeg's own progress events
+  const progressHandler = ({ progress }: { progress: number }) => {
+    if (signal?.aborted) return
+    const pct = Math.floor(10 + (Math.min(progress, 1) * 85))
+    const frame = Math.floor(Math.min(progress, 1) * TOTAL_FRAMES)
+    onProgress({
+      status: 'extracting',
+      progress: pct,
+      currentFrame: frame,
+      totalFrames: TOTAL_FRAMES,
+      message: `Extracting frame ${frame} of ${TOTAL_FRAMES}…`,
+    })
+  }
 
-    // Only add -vf if video needs scaling — avoids unnecessary re-encode on normal videos
-    const args = [
-      '-i', inputFilename,
-      '-ss', timestamp.toFixed(4),
-      '-vframes', '1',
-      ...(scaleFilter ? ['-vf', scaleFilter] : []),
-      '-q:v', '2',
-      '-vsync', '0',
-      outFile,
-    ]
+  ffmpeg.on('progress', progressHandler)
 
-    try {
-      await ffmpeg.exec(args)
-    } catch (err) {
-      console.warn(`[Extract] exec failed frame ${i + 1}:`, err)
-    }
+  try {
+    await ffmpeg.exec(args)
+  } catch (err) {
+    console.error('[Extract] Single-pass exec failed:', err)
+    throw new Error(
+      'FFmpeg failed during frame extraction. ' +
+      'If using Brave, disable Shields for this site and try again. ' +
+      'Otherwise try Chrome or Edge.'
+    )
+  } finally {
+    ffmpeg.off('progress', progressHandler)
+  }
 
+  if (signal?.aborted) throw new Error('Cancelled')
+
+  // Read all output frames from WASM virtual filesystem
+  onProgress({
+    status: 'extracting',
+    message: 'Reading extracted frames…',
+    progress: 95,
+    totalFrames: TOTAL_FRAMES,
+    currentFrame: 0,
+  })
+
+  for (let i = 1; i <= TOTAL_FRAMES; i++) {
+    const outFile = `frame_${String(i).padStart(2, '0')}.jpg`
     try {
       const data = await ffmpeg.readFile(outFile)
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const uint8 = new Uint8Array((data as any).buffer ?? data)
       const blob = new Blob([uint8], { type: 'image/jpeg' })
-
-      // Use scaled dimensions if we applied a filter, otherwise use original
-      const outWidth = scaleFilter ? Math.min(width, MAX_DIMENSION) : width
-      const outHeight = scaleFilter ? Math.min(height, MAX_DIMENSION) : height
-
       frames.push({
-        id: i + 1,
-        frameNumber: i + 1,
-        timestamp,
+        id: i,
+        frameNumber: i,
+        timestamp: (i - 1) * interval,
         dataUrl: URL.createObjectURL(blob),
         width: outWidth,
         height: outHeight,
@@ -258,16 +283,8 @@ export async function extractFrames(
       })
       await ffmpeg.deleteFile(outFile)
     } catch {
-      console.warn(`[Extract] read failed frame ${i + 1}`)
+      console.warn(`[Extract] read failed frame ${i}`)
     }
-
-    onProgress({
-      status: 'extracting',
-      progress: 10 + Math.floor(((i + 1) / TOTAL_FRAMES) * 88),
-      currentFrame: i + 1,
-      totalFrames: TOTAL_FRAMES,
-      message: `Extracting frame ${i + 1} of ${TOTAL_FRAMES}…`,
-    })
   }
 
   try { await ffmpeg.deleteFile(inputFilename) } catch { /* ignore */ }
